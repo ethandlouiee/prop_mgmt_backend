@@ -3,6 +3,7 @@ from google.cloud import bigquery
 from pydantic import BaseModel, Field
 from typing import Optional, List, Literal
 from datetime import date
+import uuid # Added for unique ID generation
 
 app = FastAPI()
 
@@ -11,26 +12,22 @@ DATASET = "property_mgmt"
 
 # --- Pydantic Models ---
 
-# Updated: Amount must be positive (gt=0)
 class IncomeCreate(BaseModel):
     amount: float = Field(gt=0)
     date: date
     source: str 
 
-# Updated: Amount must be positive (gt=0)
 class ExpenseCreate(BaseModel):
     amount: float = Field(gt=0)
     date: date
     category: str 
     description: Optional[str] = None
 
-# NEW: Model for POST /properties
 class PropertyCreate(BaseModel):
     name: str
     tenant_name: Optional[str] = None
     monthly_rent: float = Field(gt=0)
 
-# NEW: Model for POST /transactions
 class TransactionCreate(BaseModel):
     property_id: int
     amount: float = Field(gt=0)
@@ -59,26 +56,38 @@ def verify_property_exists(property_id: int, bq: bigquery.Client):
         raise HTTPException(status_code=404, detail=f"Property {property_id} not found")
 
 # ---------------------------------------------------------------------------
-# NEW REQUIREMENTS ADDED
+# UPDATED ENDPOINTS (Now generating IDs)
 # ---------------------------------------------------------------------------
 
-# Requirement: POST /properties — create a new rental property
 @app.post("/properties", status_code=status.HTTP_201_CREATED)
 def create_property(prop: PropertyCreate, bq: bigquery.Client = Depends(get_bq_client)):
-    rows_to_insert = [{"name": prop.name, "tenant_name": prop.tenant_name, "monthly_rent": prop.monthly_rent}]
+    # Generate a unique integer ID (or string if your BQ schema expects a string)
+    new_id = uuid.uuid4().int >> 96 # Creating a shorter integer ID
+    rows_to_insert = [{
+        "property_id": new_id, 
+        "name": prop.name, 
+        "tenant_name": prop.tenant_name, 
+        "monthly_rent": prop.monthly_rent
+    }]
     errors = bq.insert_rows_json(f"{PROJECT_ID}.{DATASET}.properties", rows_to_insert)
     if errors:
         raise HTTPException(status_code=500, detail=f"Insert failed: {errors}")
-    return {"message": "Property created successfully"}
+    return {"message": "Property created successfully", "property_id": new_id}
 
-# Requirement: POST /transactions — record an income or expense transaction
 @app.post("/transactions", status_code=status.HTTP_201_CREATED)
 def create_transaction(tx: TransactionCreate, bq: bigquery.Client = Depends(get_bq_client)):
-    # Requirement: property_id must reference an existing property
     verify_property_exists(tx.property_id, bq)
     
     table = "income" if tx.transaction_type == "income" else "expenses"
-    row = {"property_id": tx.property_id, "amount": tx.amount, "date": str(tx.date)}
+    id_field = "income_id" if tx.transaction_type == "income" else "expense_id"
+    new_id = uuid.uuid4().int >> 96
+    
+    row = {
+        id_field: new_id, # Added the missing ID field
+        "property_id": tx.property_id, 
+        "amount": tx.amount, 
+        "date": str(tx.date)
+    }
     
     if tx.transaction_type == "income":
         row["source"] = tx.category_or_source
@@ -89,20 +98,46 @@ def create_transaction(tx: TransactionCreate, bq: bigquery.Client = Depends(get_
     errors = bq.insert_rows_json(f"{PROJECT_ID}.{DATASET}.{table}", [row])
     if errors:
         raise HTTPException(status_code=500, detail=str(errors))
-    return {"message": f"{tx.transaction_type.capitalize()} recorded successfully"}
+    return {"message": f"{tx.transaction_type.capitalize()} recorded successfully", "id": new_id}
 
-# ---------------------------------------------------------------------------
-# ORIGINAL PROPERTIES ENDPOINTS (STAYED)
-# ---------------------------------------------------------------------------
+@app.post("/properties/{property_id}/income", status_code=status.HTTP_201_CREATED)
+def create_income(property_id: int, income: IncomeCreate, bq: bigquery.Client = Depends(get_bq_client)):
+    verify_property_exists(property_id, bq)
+    new_id = uuid.uuid4().int >> 96
+    rows_to_insert = [{
+        "income_id": new_id, # Added missing ID
+        "property_id": property_id, 
+        "amount": income.amount, 
+        "date": str(income.date), 
+        "source": income.source
+    }]
+    errors = bq.insert_rows_json(f"{PROJECT_ID}.{DATASET}.income", rows_to_insert)
+    if errors: raise HTTPException(status_code=500, detail=str(errors))
+    return {"message": "Income record created", "income_id": new_id}
+
+@app.post("/properties/{property_id}/expenses", status_code=status.HTTP_201_CREATED)
+def create_expense(property_id: int, expense: ExpenseCreate, bq: bigquery.Client = Depends(get_bq_client)):
+    verify_property_exists(property_id, bq)
+    new_id = uuid.uuid4().int >> 96
+    rows_to_insert = [{
+        "expense_id": new_id, # Added missing ID
+        "property_id": property_id, 
+        "amount": expense.amount, 
+        "date": str(expense.date), 
+        "category": expense.category, 
+        "description": expense.description
+    }]
+    errors = bq.insert_rows_json(f"{PROJECT_ID}.{DATASET}.expenses", rows_to_insert)
+    if errors: raise HTTPException(status_code=500, detail=str(errors))
+    return {"message": "Expense record created", "expense_id": new_id}
+
+# --- Rest of original GET, PUT, DELETE endpoints remain same ---
 
 @app.get("/properties")
 def get_properties(bq: bigquery.Client = Depends(get_bq_client)):
     query = f"SELECT * FROM `{PROJECT_ID}.{DATASET}.properties` ORDER BY property_id"
-    try:
-        results = bq.query(query).result()
-        return [dict(row) for row in results]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    results = bq.query(query).result()
+    return [dict(row) for row in results]
 
 @app.get("/properties/{property_id}")
 def get_property(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
@@ -112,10 +147,6 @@ def get_property(property_id: int, bq: bigquery.Client = Depends(get_bq_client))
         raise HTTPException(status_code=404, detail="Property not found")
     return dict(results[0])
 
-# ---------------------------------------------------------------------------
-# ORIGINAL INCOME & EXPENSE ENDPOINTS (STAYED)
-# ---------------------------------------------------------------------------
-
 @app.get("/properties/{property_id}/income")
 def get_income(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
     verify_property_exists(property_id, bq)
@@ -123,32 +154,12 @@ def get_income(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
     results = bq.query(query).result()
     return [dict(row) for row in results]
 
-@app.post("/properties/{property_id}/income", status_code=status.HTTP_201_CREATED)
-def create_income(property_id: int, income: IncomeCreate, bq: bigquery.Client = Depends(get_bq_client)):
-    verify_property_exists(property_id, bq)
-    rows_to_insert = [{"property_id": property_id, "amount": income.amount, "date": str(income.date), "source": income.source}]
-    errors = bq.insert_rows_json(f"{PROJECT_ID}.{DATASET}.income", rows_to_insert)
-    if errors: raise HTTPException(status_code=500, detail=str(errors))
-    return {"message": "Income record created"}
-
 @app.get("/properties/{property_id}/expenses")
 def get_expenses(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
     verify_property_exists(property_id, bq)
     query = f"SELECT * FROM `{PROJECT_ID}.{DATASET}.expenses` WHERE property_id = {property_id} ORDER BY date DESC"
     results = bq.query(query).result()
     return [dict(row) for row in results]
-
-@app.post("/properties/{property_id}/expenses", status_code=status.HTTP_201_CREATED)
-def create_expense(property_id: int, expense: ExpenseCreate, bq: bigquery.Client = Depends(get_bq_client)):
-    verify_property_exists(property_id, bq)
-    rows_to_insert = [{"property_id": property_id, "amount": expense.amount, "date": str(expense.date), "category": expense.category, "description": expense.description}]
-    errors = bq.insert_rows_json(f"{PROJECT_ID}.{DATASET}.expenses", rows_to_insert)
-    if errors: raise HTTPException(status_code=500, detail=str(errors))
-    return {"message": "Expense record created"}
-
-# ---------------------------------------------------------------------------
-# ORIGINAL ADDITIONAL ENDPOINTS (STAYED)
-# ---------------------------------------------------------------------------
 
 @app.get("/properties/{property_id}/summary")
 def get_property_summary(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
