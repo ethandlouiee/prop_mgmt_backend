@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from google.cloud import bigquery
-from pydantic import BaseModel
-from typing import Optional, List
+from pydantic import BaseModel, Field
+from typing import Optional, List, Literal
 from datetime import date
 
 app = FastAPI()
@@ -9,24 +9,41 @@ app = FastAPI()
 PROJECT_ID = "calculatorapi-489215"
 DATASET = "property_mgmt"
 
-# --- Pydantic Models for Data Validation ---
+# --- Pydantic Models ---
 
+# Updated: Amount must be positive (gt=0)
 class IncomeCreate(BaseModel):
-    amount: float
+    amount: float = Field(gt=0)
     date: date
-    source: str  # e.g., "Rent", "Late Fee"
+    source: str 
 
+# Updated: Amount must be positive (gt=0)
 class ExpenseCreate(BaseModel):
-    amount: float
+    amount: float = Field(gt=0)
     date: date
-    category: str # e.g., "Repairs", "Taxes"
+    category: str 
+    description: Optional[str] = None
+
+# NEW: Model for POST /properties
+class PropertyCreate(BaseModel):
+    name: str
+    tenant_name: Optional[str] = None
+    monthly_rent: float = Field(gt=0)
+
+# NEW: Model for POST /transactions
+class TransactionCreate(BaseModel):
+    property_id: int
+    amount: float = Field(gt=0)
+    date: date
+    transaction_type: Literal["income", "expense"]
+    category_or_source: str 
     description: Optional[str] = None
 
 class PropertyUpdate(BaseModel):
     tenant_name: Optional[str] = None
     monthly_rent: Optional[float] = None
 
-# --- Dependency: BigQuery client ---
+# --- Dependency & Helpers ---
 
 def get_bq_client():
     client = bigquery.Client()
@@ -35,8 +52,6 @@ def get_bq_client():
     finally:
         client.close()
 
-# --- Helper Function: Check if Property Exists ---
-
 def verify_property_exists(property_id: int, bq: bigquery.Client):
     query = f"SELECT property_id FROM `{PROJECT_ID}.{DATASET}.properties` WHERE property_id = {property_id}"
     results = list(bq.query(query).result())
@@ -44,7 +59,40 @@ def verify_property_exists(property_id: int, bq: bigquery.Client):
         raise HTTPException(status_code=404, detail=f"Property {property_id} not found")
 
 # ---------------------------------------------------------------------------
-# PROPERTIES ENDPOINTS
+# NEW REQUIREMENTS ADDED
+# ---------------------------------------------------------------------------
+
+# Requirement: POST /properties — create a new rental property
+@app.post("/properties", status_code=status.HTTP_201_CREATED)
+def create_property(prop: PropertyCreate, bq: bigquery.Client = Depends(get_bq_client)):
+    rows_to_insert = [{"name": prop.name, "tenant_name": prop.tenant_name, "monthly_rent": prop.monthly_rent}]
+    errors = bq.insert_rows_json(f"{PROJECT_ID}.{DATASET}.properties", rows_to_insert)
+    if errors:
+        raise HTTPException(status_code=500, detail=f"Insert failed: {errors}")
+    return {"message": "Property created successfully"}
+
+# Requirement: POST /transactions — record an income or expense transaction
+@app.post("/transactions", status_code=status.HTTP_201_CREATED)
+def create_transaction(tx: TransactionCreate, bq: bigquery.Client = Depends(get_bq_client)):
+    # Requirement: property_id must reference an existing property
+    verify_property_exists(tx.property_id, bq)
+    
+    table = "income" if tx.transaction_type == "income" else "expenses"
+    row = {"property_id": tx.property_id, "amount": tx.amount, "date": str(tx.date)}
+    
+    if tx.transaction_type == "income":
+        row["source"] = tx.category_or_source
+    else:
+        row["category"] = tx.category_or_source
+        row["description"] = tx.description
+
+    errors = bq.insert_rows_json(f"{PROJECT_ID}.{DATASET}.{table}", [row])
+    if errors:
+        raise HTTPException(status_code=500, detail=str(errors))
+    return {"message": f"{tx.transaction_type.capitalize()} recorded successfully"}
+
+# ---------------------------------------------------------------------------
+# ORIGINAL PROPERTIES ENDPOINTS (STAYED)
 # ---------------------------------------------------------------------------
 
 @app.get("/properties")
@@ -65,7 +113,7 @@ def get_property(property_id: int, bq: bigquery.Client = Depends(get_bq_client))
     return dict(results[0])
 
 # ---------------------------------------------------------------------------
-# INCOME ENDPOINTS
+# ORIGINAL INCOME & EXPENSE ENDPOINTS (STAYED)
 # ---------------------------------------------------------------------------
 
 @app.get("/properties/{property_id}/income")
@@ -80,13 +128,8 @@ def create_income(property_id: int, income: IncomeCreate, bq: bigquery.Client = 
     verify_property_exists(property_id, bq)
     rows_to_insert = [{"property_id": property_id, "amount": income.amount, "date": str(income.date), "source": income.source}]
     errors = bq.insert_rows_json(f"{PROJECT_ID}.{DATASET}.income", rows_to_insert)
-    if errors:
-        raise HTTPException(status_code=500, detail=f"Insert failed: {errors}")
+    if errors: raise HTTPException(status_code=500, detail=str(errors))
     return {"message": "Income record created"}
-
-# ---------------------------------------------------------------------------
-# EXPENSES ENDPOINTS
-# ---------------------------------------------------------------------------
 
 @app.get("/properties/{property_id}/expenses")
 def get_expenses(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
@@ -98,20 +141,15 @@ def get_expenses(property_id: int, bq: bigquery.Client = Depends(get_bq_client))
 @app.post("/properties/{property_id}/expenses", status_code=status.HTTP_201_CREATED)
 def create_expense(property_id: int, expense: ExpenseCreate, bq: bigquery.Client = Depends(get_bq_client)):
     verify_property_exists(property_id, bq)
-    rows_to_insert = [{
-        "property_id": property_id, "amount": expense.amount, 
-        "date": str(expense.date), "category": expense.category, "description": expense.description
-    }]
+    rows_to_insert = [{"property_id": property_id, "amount": expense.amount, "date": str(expense.date), "category": expense.category, "description": expense.description}]
     errors = bq.insert_rows_json(f"{PROJECT_ID}.{DATASET}.expenses", rows_to_insert)
-    if errors:
-        raise HTTPException(status_code=500, detail=f"Insert failed: {errors}")
+    if errors: raise HTTPException(status_code=500, detail=str(errors))
     return {"message": "Expense record created"}
 
 # ---------------------------------------------------------------------------
-# ADDITIONAL ENDPOINTS
+# ORIGINAL ADDITIONAL ENDPOINTS (STAYED)
 # ---------------------------------------------------------------------------
 
-# 1. Financial Summary for a Property (Calculated Net Flow)
 @app.get("/properties/{property_id}/summary")
 def get_property_summary(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
     verify_property_exists(property_id, bq)
@@ -121,54 +159,32 @@ def get_property_summary(property_id: int, bq: bigquery.Client = Depends(get_bq_
             (SELECT SUM(amount) FROM `{PROJECT_ID}.{DATASET}.expenses` WHERE property_id = {property_id}) as total_expenses
     """
     row = list(bq.query(query).result())[0]
-    income = row.total_income or 0.0
-    expenses = row.total_expenses or 0.0
-    return {
-        "property_id": property_id,
-        "total_income": income,
-        "total_expenses": expenses,
-        "net_cash_flow": income - expenses
-    }
+    income, expenses = row.total_income or 0.0, row.total_expenses or 0.0
+    return {"property_id": property_id, "total_income": income, "total_expenses": expenses, "net_cash_flow": income - expenses}
 
-# 2. Update Property Details (e.g., Change Tenant or Rent)
 @app.put("/properties/{property_id}")
 def update_property(property_id: int, update_data: PropertyUpdate, bq: bigquery.Client = Depends(get_bq_client)):
     verify_property_exists(property_id, bq)
     updates = []
-    if update_data.tenant_name is not None:
-        updates.append(f"tenant_name = '{update_data.tenant_name}'")
-    if update_data.monthly_rent is not None:
-        updates.append(f"monthly_rent = {update_data.monthly_rent}")
-    
-    if not updates:
-        raise HTTPException(status_code=400, detail="No fields provided to update")
-
+    if update_data.tenant_name is not None: updates.append(f"tenant_name = '{update_data.tenant_name}'")
+    if update_data.monthly_rent is not None: updates.append(f"monthly_rent = {update_data.monthly_rent}")
+    if not updates: raise HTTPException(status_code=400, detail="No fields provided")
     query = f"UPDATE `{PROJECT_ID}.{DATASET}.properties` SET {', '.join(updates)} WHERE property_id = {property_id}"
-    try:
-        bq.query(query).result()
-        return {"message": "Property updated successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    bq.query(query).result()
+    return {"message": "Property updated successfully"}
 
-# 3. Delete a Property (Cleanup)
 @app.delete("/properties/{property_id}")
 def delete_property(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
     verify_property_exists(property_id, bq)
-    # Note: In a real DB, you'd use foreign key cascades. In BQ, we manually clear associated records.
-    try:
-        bq.query(f"DELETE FROM `{PROJECT_ID}.{DATASET}.income` WHERE property_id = {property_id}").result()
-        bq.query(f"DELETE FROM `{PROJECT_ID}.{DATASET}.expenses` WHERE property_id = {property_id}").result()
-        bq.query(f"DELETE FROM `{PROJECT_ID}.{DATASET}.properties` WHERE property_id = {property_id}").result()
-        return {"message": f"Property {property_id} and all related records deleted"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    bq.query(f"DELETE FROM `{PROJECT_ID}.{DATASET}.income` WHERE property_id = {property_id}").result()
+    bq.query(f"DELETE FROM `{PROJECT_ID}.{DATASET}.expenses` WHERE property_id = {property_id}").result()
+    bq.query(f"DELETE FROM `{PROJECT_ID}.{DATASET}.properties` WHERE property_id = {property_id}").result()
+    return {"message": f"Property {property_id} deleted"}
 
-# 4. Global Report: All Properties with Overdue Income (No payment this month)
 @app.get("/reports/overdue")
 def get_overdue_rent(bq: bigquery.Client = Depends(get_bq_client)):
     query = f"""
-        SELECT p.property_id, p.name, p.tenant_name 
-        FROM `{PROJECT_ID}.{DATASET}.properties` p
+        SELECT p.property_id, p.name, p.tenant_name FROM `{PROJECT_ID}.{DATASET}.properties` p
         WHERE p.property_id NOT IN (
             SELECT property_id FROM `{PROJECT_ID}.{DATASET}.income` 
             WHERE EXTRACT(MONTH FROM date) = EXTRACT(MONTH FROM CURRENT_DATE())
@@ -177,4 +193,3 @@ def get_overdue_rent(bq: bigquery.Client = Depends(get_bq_client)):
     """
     results = bq.query(query).result()
     return [dict(row) for row in results]
-    
