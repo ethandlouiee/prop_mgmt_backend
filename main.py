@@ -9,16 +9,19 @@ import uuid
 
 app = FastAPI()
 
+# Configuration for your specific Google Cloud Project and Dataset
 PROJECT_ID = "calculatorapi-489215"
 DATASET = "property_mgmt"
 
-# --- Custom Error Handlers ---
+# -----------------------------------------------------------------------------
+# CUSTOM ERROR HANDLERS
+# -----------------------------------------------------------------------------
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """
-    Custom handler for 422 errors. Converts technical Pydantic errors 
-    into user-friendly messages for non-technical users.
+    Interprets Pydantic validation errors (422) and returns conversational 
+    messages for non-technical users.
     """
     details = exc.errors()
     friendly_errors = []
@@ -32,13 +35,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         elif msg_type == "greater_than":
             limit = error.get("ctx", {}).get("gt")
             friendly_errors.append(f"The value for '{field}' must be greater than {limit}.")
-        elif msg_type == "type_error.float":
-            friendly_errors.append(f"The value for '{field}' must be a valid number.")
+        elif msg_type == "type_error.integer":
+            friendly_errors.append(f"The ID for '{field}' must be a whole number.")
         elif msg_type == "type_error.date":
             friendly_errors.append(f"The date provided for '{field}' is invalid. Please use YYYY-MM-DD.")
-        elif msg_type == "value_error.const":
-            allowed = error.get("ctx", {}).get("given")
-            friendly_errors.append(f"Invalid choice for '{field}'. Please use one of the allowed options.")
         else:
             friendly_errors.append(f"There is an issue with the '{field}' field: {error.get('msg')}")
 
@@ -50,14 +50,16 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request: Request, exc: HTTPException):
     """
-    Standardizes the look of 404 and 500 errors to match the friendly style.
+    Wraps standard HTTP exceptions (like 404s) into a friendly JSON format.
     """
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": "Request Failed", "message": exc.detail},
     )
 
-# --- Schema-Matched Pydantic Models ---
+# -----------------------------------------------------------------------------
+# PYDANTIC MODELS (Schema Matched to BigQuery)
+# -----------------------------------------------------------------------------
 
 class IncomeCreate(BaseModel):
     amount: float = Field(gt=0)
@@ -72,6 +74,7 @@ class ExpenseCreate(BaseModel):
     description: Optional[str] = None
 
 class PropertyCreate(BaseModel):
+    property_id: int = Field(gt=0, description="User-provided unique ID")
     name: str
     address: str
     city: str
@@ -99,9 +102,12 @@ class PropertyUpdate(BaseModel):
     postal_code: Optional[str] = None
     property_type: Optional[str] = None
 
-# --- Dependency & Helpers ---
+# -----------------------------------------------------------------------------
+# DEPENDENCIES & HELPERS
+# -----------------------------------------------------------------------------
 
 def get_bq_client():
+    """Generates a BigQuery client and ensures it is closed after use."""
     client = bigquery.Client()
     try:
         yield client
@@ -109,6 +115,7 @@ def get_bq_client():
         client.close()
 
 def verify_property_exists(property_id: int, bq: bigquery.Client):
+    """Checks if a property exists in BigQuery before performing related operations."""
     query = f"SELECT property_id FROM `{PROJECT_ID}.{DATASET}.properties` WHERE property_id = {property_id}"
     results = list(bq.query(query).result())
     if not results:
@@ -117,13 +124,22 @@ def verify_property_exists(property_id: int, bq: bigquery.Client):
             detail=f"We couldn't find a property with ID {property_id}. Please check the ID and try again."
         )
 
-# --- Endpoints ---
+# -----------------------------------------------------------------------------
+# PROPERTY ENDPOINTS
+# -----------------------------------------------------------------------------
 
 @app.post("/properties", status_code=status.HTTP_201_CREATED)
 def create_property(prop: PropertyCreate, bq: bigquery.Client = Depends(get_bq_client)):
-    new_id = uuid.uuid4().int >> 96 
+    """Creates a new property record using a user-provided ID."""
+    check_query = f"SELECT property_id FROM `{PROJECT_ID}.{DATASET}.properties` WHERE property_id = {prop.property_id}"
+    if list(bq.query(check_query).result()):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Property ID {prop.property_id} already exists. Please choose a different ID."
+        )
+
     rows_to_insert = [{
-        "property_id": new_id, 
+        "property_id": prop.property_id,
         "name": prop.name, 
         "address": prop.address,
         "city": prop.city,
@@ -135,11 +151,64 @@ def create_property(prop: PropertyCreate, bq: bigquery.Client = Depends(get_bq_c
     }]
     errors = bq.insert_rows_json(f"{PROJECT_ID}.{DATASET}.properties", rows_to_insert)
     if errors:
-        raise HTTPException(status_code=500, detail=f"Database error during property creation: {errors}")
-    return {"message": "Property created successfully!", "property_id": new_id}
+        raise HTTPException(status_code=500, detail=f"Database insertion error: {errors}")
+    return {"message": "Property created successfully!", "property_id": prop.property_id}
+
+@app.get("/properties")
+def get_properties(bq: bigquery.Client = Depends(get_bq_client)):
+    """Returns a complete list of all rental properties."""
+    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET}.properties` ORDER BY property_id"
+    results = bq.query(query).result()
+    return [dict(row) for row in results]
+
+@app.get("/properties/{property_id}")
+def get_property(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
+    """Retrieves full details for a specific property."""
+    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET}.properties` WHERE property_id = {property_id}"
+    results = list(bq.query(query).result())
+    if not results:
+        raise HTTPException(status_code=404, detail="No property found with that ID.")
+    return dict(results[0])
+
+@app.put("/properties/{property_id}")
+def update_property(property_id: int, update_data: PropertyUpdate, bq: bigquery.Client = Depends(get_bq_client)):
+    """Updates property fields dynamically based on user input."""
+    verify_property_exists(property_id, bq)
+    updates = []
+    data_dict = update_data.dict(exclude_none=True)
+    
+    for key, value in data_dict.items():
+        if isinstance(value, str):
+            updates.append(f"{key} = '{value}'")
+        else:
+            updates.append(f"{key} = {value}")
+            
+    if not updates:
+        raise HTTPException(status_code=400, detail="No valid update fields provided.")
+        
+    query = f"UPDATE `{PROJECT_ID}.{DATASET}.properties` SET {', '.join(updates)} WHERE property_id = {property_id}"
+    bq.query(query).result()
+    return {"message": "Property updated successfully."}
+
+@app.delete("/properties/{property_id}")
+def delete_property(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
+    """Removes a property and all its historical financial records."""
+    verify_property_exists(property_id, bq)
+    
+    # Cleanup child records first to ensure referential integrity
+    bq.query(f"DELETE FROM `{PROJECT_ID}.{DATASET}.income` WHERE property_id = {property_id}").result()
+    bq.query(f"DELETE FROM `{PROJECT_ID}.{DATASET}.expenses` WHERE property_id = {property_id}").result()
+    bq.query(f"DELETE FROM `{PROJECT_ID}.{DATASET}.properties` WHERE property_id = {property_id}").result()
+    
+    return {"message": f"Property {property_id} and all related records deleted."}
+
+# -----------------------------------------------------------------------------
+# FINANCIAL ENDPOINTS (Transactions, Income, Expenses)
+# -----------------------------------------------------------------------------
 
 @app.post("/transactions", status_code=status.HTTP_201_CREATED)
 def create_transaction(tx: TransactionCreate, bq: bigquery.Client = Depends(get_bq_client)):
+    """Unified route to record either income or expenses."""
     verify_property_exists(tx.property_id, bq)
     
     table = "income" if tx.transaction_type == "income" else "expenses"
@@ -162,25 +231,12 @@ def create_transaction(tx: TransactionCreate, bq: bigquery.Client = Depends(get_
 
     errors = bq.insert_rows_json(f"{PROJECT_ID}.{DATASET}.{table}", [row])
     if errors:
-        raise HTTPException(status_code=500, detail="We encountered an error saving this transaction to the database.")
+        raise HTTPException(status_code=500, detail="Failed to save transaction.")
     return {"message": f"{tx.transaction_type.capitalize()} recorded successfully.", "id": new_id}
-
-@app.get("/properties")
-def get_properties(bq: bigquery.Client = Depends(get_bq_client)):
-    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET}.properties` ORDER BY property_id"
-    results = bq.query(query).result()
-    return [dict(row) for row in results]
-
-@app.get("/properties/{property_id}")
-def get_property(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
-    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET}.properties` WHERE property_id = {property_id}"
-    results = list(bq.query(query).result())
-    if not results:
-        raise HTTPException(status_code=404, detail=f"No property found with ID {property_id}.")
-    return dict(results[0])
 
 @app.get("/properties/{property_id}/income")
 def get_income(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
+    """Retrieves all income records for a specific property."""
     verify_property_exists(property_id, bq)
     query = f"SELECT * FROM `{PROJECT_ID}.{DATASET}.income` WHERE property_id = {property_id} ORDER BY date DESC"
     results = bq.query(query).result()
@@ -188,6 +244,7 @@ def get_income(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
 
 @app.post("/properties/{property_id}/income", status_code=status.HTTP_201_CREATED)
 def create_income(property_id: int, income: IncomeCreate, bq: bigquery.Client = Depends(get_bq_client)):
+    """Direct route for recording property income."""
     verify_property_exists(property_id, bq)
     new_id = uuid.uuid4().int >> 96
     rows_to_insert = [{
@@ -203,6 +260,7 @@ def create_income(property_id: int, income: IncomeCreate, bq: bigquery.Client = 
 
 @app.get("/properties/{property_id}/expenses")
 def get_expenses(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
+    """Retrieves all expense records for a specific property."""
     verify_property_exists(property_id, bq)
     query = f"SELECT * FROM `{PROJECT_ID}.{DATASET}.expenses` WHERE property_id = {property_id} ORDER BY date DESC"
     results = bq.query(query).result()
@@ -210,6 +268,7 @@ def get_expenses(property_id: int, bq: bigquery.Client = Depends(get_bq_client))
 
 @app.post("/properties/{property_id}/expenses", status_code=status.HTTP_201_CREATED)
 def create_expense(property_id: int, expense: ExpenseCreate, bq: bigquery.Client = Depends(get_bq_client)):
+    """Direct route for recording property expenses."""
     verify_property_exists(property_id, bq)
     new_id = uuid.uuid4().int >> 96
     rows_to_insert = [{
@@ -225,33 +284,13 @@ def create_expense(property_id: int, expense: ExpenseCreate, bq: bigquery.Client
     if errors: raise HTTPException(status_code=500, detail="Failed to record expense.")
     return {"message": "Expense record created successfully.", "expense_id": new_id}
 
-@app.put("/properties/{property_id}")
-def update_property(property_id: int, update_data: PropertyUpdate, bq: bigquery.Client = Depends(get_bq_client)):
-    verify_property_exists(property_id, bq)
-    updates = []
-    data_dict = update_data.dict(exclude_none=True)
-    for key, value in data_dict.items():
-        if isinstance(value, str):
-            updates.append(f"{key} = '{value}'")
-        else:
-            updates.append(f"{key} = {value}")
-            
-    if not updates: 
-        raise HTTPException(status_code=400, detail="No changes were provided to update.")
-    query = f"UPDATE `{PROJECT_ID}.{DATASET}.properties` SET {', '.join(updates)} WHERE property_id = {property_id}"
-    bq.query(query).result()
-    return {"message": "Property updated successfully."}
-
-@app.delete("/properties/{property_id}")
-def delete_property(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
-    verify_property_exists(property_id, bq)
-    bq.query(f"DELETE FROM `{PROJECT_ID}.{DATASET}.income` WHERE property_id = {property_id}").result()
-    bq.query(f"DELETE FROM `{PROJECT_ID}.{DATASET}.expenses` WHERE property_id = {property_id}").result()
-    bq.query(f"DELETE FROM `{PROJECT_ID}.{DATASET}.properties` WHERE property_id = {property_id}").result()
-    return {"message": f"Property {property_id} and all its data have been deleted."}
+# -----------------------------------------------------------------------------
+# REPORTING ENDPOINTS
+# -----------------------------------------------------------------------------
 
 @app.get("/reports/overdue")
 def get_overdue_rent(bq: bigquery.Client = Depends(get_bq_client)):
+    """Identifies properties that have not recorded rent for the current month."""
     query = f"""
         SELECT p.property_id, p.name, p.tenant_name FROM `{PROJECT_ID}.{DATASET}.properties` p
         WHERE p.property_id NOT IN (
