@@ -172,23 +172,37 @@ def get_property(property_id: int, bq: bigquery.Client = Depends(get_bq_client))
 
 @app.put("/properties/{property_id}")
 def update_property(property_id: int, update_data: PropertyUpdate, bq: bigquery.Client = Depends(get_bq_client)):
-    """Updates property fields dynamically based on user input."""
+    """
+    Updates property fields dynamically. 
+    Fix: Ensures numeric values like 0 are handled correctly in SQL strings.
+    """
     verify_property_exists(property_id, bq)
+    
     updates = []
+    # .dict(exclude_none=True) ensures we only update what the user sent
     data_dict = update_data.dict(exclude_none=True)
     
     for key, value in data_dict.items():
         if isinstance(value, str):
+            # Strings need single quotes for BigQuery SQL
             updates.append(f"{key} = '{value}'")
         else:
+            # Numbers (int/float) must NOT have quotes
             updates.append(f"{key} = {value}")
             
     if not updates:
         raise HTTPException(status_code=400, detail="No valid update fields provided.")
         
+    # Construct the SQL
     query = f"UPDATE `{PROJECT_ID}.{DATASET}.properties` SET {', '.join(updates)} WHERE property_id = {property_id}"
-    bq.query(query).result()
-    return {"message": "Property updated successfully."}
+    
+    try:
+        query_job = bq.query(query)
+        query_job.result() # This triggers the actual execution
+        return {"message": "Property updated successfully.", "updated_fields": list(data_dict.keys())}
+    except Exception as e:
+        # This will now tell you EXACTLY why BigQuery rejected it
+        raise HTTPException(status_code=500, detail=f"BigQuery Update Error: {str(e)}")
 
 @app.delete("/properties/{property_id}")
 def delete_property(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
