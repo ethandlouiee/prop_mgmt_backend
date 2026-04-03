@@ -301,3 +301,28 @@ def get_overdue_rent(bq: bigquery.Client = Depends(get_bq_client)):
     """
     results = bq.query(query).result()
     return [dict(row) for row in results]
+    
+@app.get("/properties/{property_id}/summary")
+def get_property_summary(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
+    """
+    Calculates the total income, total expenses, and net cash flow 
+    for a specific property across all time.
+    """
+    verify_property_exists(property_id, bq)
+    
+    # Query for total income
+    income_query = f"SELECT SUM(amount) as total FROM `{PROJECT_ID}.{DATASET}.income` WHERE property_id = {property_id}"
+    income_result = list(bq.query(income_query).result())
+    total_income = income_result[0].total if income_result[0].total else 0.0
+    
+    # Query for total expenses
+    expense_query = f"SELECT SUM(amount) as total FROM `{PROJECT_ID}.{DATASET}.expenses` WHERE property_id = {property_id}"
+    expense_result = list(bq.query(expense_query).result())
+    total_expenses = expense_result[0].total if expense_result[0].total else 0.0
+    
+    return {
+        "property_id": property_id,
+        "total_income": total_income,
+        "total_expenses": total_expenses,
+        "net_cash_flow": total_income - total_expenses
+    }
