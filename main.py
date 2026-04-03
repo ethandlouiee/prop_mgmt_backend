@@ -170,40 +170,35 @@ def get_property(property_id: int, bq: bigquery.Client = Depends(get_bq_client))
         raise HTTPException(status_code=404, detail="No property found with that ID.")
     return dict(results[0])
 
-@app.put("/properties/{property_id}")
-def update_property(property_id: int, update_data: PropertyUpdate, bq: bigquery.Client = Depends(get_bq_client)):
+@app.get("/transactions/recent")
+def get_recent_activity(limit: int = 10, bq: bigquery.Client = Depends(get_bq_client)):
     """
-    Updates property fields dynamically. 
-    Fix: Ensures numeric values like 0 are handled correctly in SQL strings.
+    CUSTOM ENDPOINT: Provides a unified activity feed of the most recent 
+    income and expense transactions across all properties.
     """
-    verify_property_exists(property_id, bq)
+    # Query for recent income
+    income_query = f"""
+        SELECT 'income' as type, amount, date, description as detail, property_id 
+        FROM `{PROJECT_ID}.{DATASET}.income` 
+        ORDER BY date DESC LIMIT {limit}
+    """
+    income_results = [dict(row) for row in bq.query(income_query).result()]
     
-    updates = []
-    # .dict(exclude_none=True) ensures we only update what the user sent
-    data_dict = update_data.dict(exclude_none=True)
+    # Query for recent expenses
+    expense_query = f"""
+        SELECT 'expense' as type, amount, date, category as detail, property_id 
+        FROM `{PROJECT_ID}.{DATASET}.expenses` 
+        ORDER BY date DESC LIMIT {limit}
+    """
+    expense_results = [dict(row) for row in bq.query(expense_query).result()]
     
-    for key, value in data_dict.items():
-        if isinstance(value, str):
-            # Strings need single quotes for BigQuery SQL
-            updates.append(f"{key} = '{value}'")
-        else:
-            # Numbers (int/float) must NOT have quotes
-            updates.append(f"{key} = {value}")
-            
-    if not updates:
-        raise HTTPException(status_code=400, detail="No valid update fields provided.")
-        
-    # Construct the SQL
-    query = f"UPDATE `{PROJECT_ID}.{DATASET}.properties` SET {', '.join(updates)} WHERE property_id = {property_id}"
+    # Combine and sort the results in Python
+    combined = income_results + expense_results
+    # Sort by date (descending) and take the top 'limit'
+    combined.sort(key=lambda x: str(x['date']), reverse=True)
     
-    try:
-        query_job = bq.query(query)
-        query_job.result() # This triggers the actual execution
-        return {"message": "Property updated successfully.", "updated_fields": list(data_dict.keys())}
-    except Exception as e:
-        # This will now tell you EXACTLY why BigQuery rejected it
-        raise HTTPException(status_code=500, detail=f"BigQuery Update Error: {str(e)}")
-
+    return combined[:limit]
+    
 @app.delete("/properties/{property_id}")
 def delete_property(property_id: int, bq: bigquery.Client = Depends(get_bq_client)):
     """Removes a property and all its historical financial records."""
