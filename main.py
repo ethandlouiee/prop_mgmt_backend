@@ -4,10 +4,23 @@ from fastapi.responses import JSONResponse
 from google.cloud import bigquery
 from pydantic import BaseModel, Field
 from typing import Optional, List, Literal
+from fastapi.middleware.cors import CORSMiddleware  # <--- Added Import
 from datetime import date
 import uuid
 
 app = FastAPI()
+
+# CORS CONFIGURATION
+# -----------------------------------------------------------------------------
+# "allow_origins=['*']" gives full access to any frontend domain. 
+# For production, replace '*' with your specific frontend URL.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Configuration for your specific Google Cloud Project and Dataset
 PROJECT_ID = "calculatorapi-489215"
